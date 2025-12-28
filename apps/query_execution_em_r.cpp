@@ -30,8 +30,8 @@
 #include "fanns_survey_helpers.cpp"
 #include "global_thread_counter.h"
 
-// Global atomic to store peak thread count
-std::atomic<int> peak_threads_em_r(1);
+// Global atomic to store peak thread count (must match extern declaration in global_thread_counter.h)
+std::atomic<int> peak_threads(1);
 
 namespace po = boost::program_options;
 
@@ -105,19 +105,19 @@ double compute_em_r_recall(
     const std::vector<std::vector<uint32_t>>& gt_ids,  // Ground truth per query
     const std::vector<EMRQueryAttribute>& em_r_queries,
     const std::vector<int>& r_values,
-    uint32_t query_num,
-    uint32_t k,
-    uint32_t expanded_k
+    size_t query_num,
+    size_t k,
+    size_t expanded_k
 ) {
     double total_recall = 0.0;
-    uint32_t valid_queries = 0;
+    size_t valid_queries = 0;
     
-    for (uint32_t q = 0; q < query_num; q++) {
+    for (size_t q = 0; q < query_num; q++) {
         const EMRQueryAttribute& query = em_r_queries[q];
         
         // Post-filter results by range constraint
         std::vector<uint32_t> filtered_results;
-        for (uint32_t i = 0; i < expanded_k && filtered_results.size() < k; i++) {
+        for (size_t i = 0; i < expanded_k && filtered_results.size() < k; i++) {
             uint32_t idx = result_ids[q * expanded_k + i];
             if (idx < r_values.size()) {
                 int r_val = r_values[idx];
@@ -129,7 +129,7 @@ double compute_em_r_recall(
         
         // Compute recall for this query
         if (q < gt_ids.size() && gt_ids[q].size() > 0) {
-            std::set<uint32_t> gt_set(gt_ids[q].begin(), gt_ids[q].begin() + std::min((size_t)k, gt_ids[q].size()));
+            std::set<uint32_t> gt_set(gt_ids[q].begin(), gt_ids[q].begin() + std::min(k, gt_ids[q].size()));
             std::set<uint32_t> result_set(filtered_results.begin(), filtered_results.end());
             
             size_t intersection = 0;
@@ -170,17 +170,26 @@ int search_memory_index_em_r(
 
     using TagT = uint32_t;
     
-    // Load ground truth
-    uint32_t *gt_ids_raw = nullptr;
-    float *gt_dists_raw = nullptr;
-    size_t gt_num, gt_dim;
-    diskann::load_truthset(truthset_file, gt_ids_raw, gt_dists_raw, gt_num, gt_dim);
+    // Load ground truth from .ivecs file (same approach as query_execution.cpp)
+    // We use read_ivecs() from fanns_survey_helpers.cpp rather than diskann::load_truthset()
+    // because our ground truth is in .ivecs format, not .bin format
+    std::vector<std::vector<int>> ground_truth_raw = read_ivecs(truthset_file);
+    if (ground_truth_raw.empty()) {
+        std::cerr << "ERROR: Failed to load ground truth from " << truthset_file << std::endl;
+        return -1;
+    }
+    size_t gt_num = ground_truth_raw.size();
+    size_t gt_dim = ground_truth_raw[0].size();
     
-    // Convert ground truth to vector format
+    // Convert ground truth to vector<vector<uint32_t>> format
     std::vector<std::vector<uint32_t>> gt_ids(gt_num);
     for (size_t i = 0; i < gt_num; i++) {
-        gt_ids[i].assign(gt_ids_raw + i * gt_dim, gt_ids_raw + (i + 1) * gt_dim);
+        gt_ids[i].reserve(gt_dim);
+        for (size_t j = 0; j < ground_truth_raw[i].size(); j++) {
+            gt_ids[i].push_back(static_cast<uint32_t>(ground_truth_raw[i][j]));
+        }
     }
+    std::cout << "Loaded ground truth: " << gt_num << " queries, " << gt_dim << " neighbors each" << std::endl;
 
     // Load query vectors
     T *query_data = nullptr;
@@ -218,6 +227,7 @@ int search_memory_index_em_r(
                       .with_dimension(query_dim)
                       .with_max_points(0)
                       .with_data_load_store_strategy(diskann::DataStoreStrategy::MEMORY)
+                      .with_graph_load_store_strategy(diskann::GraphStoreStrategy::MEMORY)
                       .with_data_type(diskann_type_to_name<T>())
                       .with_label_type(diskann_type_to_name<LabelT>())
                       .with_tag_type(diskann_type_to_name<TagT>())
@@ -233,8 +243,25 @@ int search_memory_index_em_r(
     index->load(index_path.c_str(), num_threads, 100);
     std::cout << "Index loaded" << std::endl;
 
-    // Expanded K for retrieving more candidates
-    uint32_t expanded_k = recall_at * expansion_factor;
+    // Expanded K for retrieving more candidates (use size_t for safety on large datasets)
+    size_t expanded_k = static_cast<size_t>(recall_at) * static_cast<size_t>(expansion_factor);
+    
+    // Memory safety check: ensure we don't try to allocate excessive memory
+    // Each result array needs: expanded_k * query_num * sizeof(uint32_t or float) = expanded_k * query_num * 4 bytes
+    // With two arrays, total = expanded_k * query_num * 8 bytes
+    size_t total_results = expanded_k * query_num;
+    size_t memory_required_bytes = total_results * (sizeof(uint32_t) + sizeof(float));
+    const size_t MAX_MEMORY_BYTES = 8ULL * 1024 * 1024 * 1024;  // 8 GB limit
+    
+    if (memory_required_bytes > MAX_MEMORY_BYTES) {
+        std::cerr << "ERROR: Memory requirement (" << memory_required_bytes / (1024*1024) 
+                  << " MB) exceeds limit (" << MAX_MEMORY_BYTES / (1024*1024) << " MB)." << std::endl;
+        std::cerr << "Consider reducing expansion_factor (current: " << expansion_factor 
+                  << ") or using fewer queries." << std::endl;
+        return -1;
+    }
+    
+    std::cout << "Memory allocation: " << memory_required_bytes / (1024*1024) << " MB for result arrays" << std::endl;
     
     std::cout << "\n=== EM+R Query Execution ===" << std::endl;
     std::cout << "K = " << recall_at << ", Expanded K = " << expanded_k << ", Expansion Factor = " << expansion_factor << std::endl;
@@ -243,11 +270,20 @@ int search_memory_index_em_r(
 
     double best_recall = 0.0;
     double qps_fanns_survey = -1.0;
+    
+    // Pre-allocate result storage ONCE (outside the loop for efficiency)
+    std::vector<uint32_t> query_result_ids;
+    std::vector<float> query_result_dists;
+    try {
+        query_result_ids.resize(total_results);
+        query_result_dists.resize(total_results);
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "ERROR: Failed to allocate memory for results: " << e.what() << std::endl;
+        std::cerr << "Required: " << memory_required_bytes / (1024*1024) << " MB" << std::endl;
+        return -1;
+    }
 
     for (uint32_t L : Lvec) {
-        // Allocate result storage
-        std::vector<uint32_t> query_result_ids(expanded_k * query_num);
-        std::vector<float> query_result_dists(expanded_k * query_num);
         
         auto start = std::chrono::high_resolution_clock::now();
         
@@ -287,19 +323,15 @@ int search_memory_index_em_r(
     monitor.join();
 
     // Output statistics in the format expected by fdann.py
-    std::cout << "\n";
-    print_memory_stats("vm_peak");
-    print_memory_stats("vm_hwm");
-    std::cout << "Peak number of threads: " << peak_threads_em_r.load() << std::endl;
-    std::cout << "===========" << std::endl;
-    std::cout << "===========" << std::endl;
-    std::cout << "QPS: " << qps_fanns_survey << std::endl;
-    std::cout << "Recall@" << recall_at << ": " << best_recall << std::endl;
+    // (same format as query_execution.cpp for parser compatibility)
+    printf("Maximum number of threads: %d\n", peak_threads.load()-1);  // Subtract 1 for monitoring thread
+    peak_memory_footprint();  // Outputs VmPeak and VmHWM lines
+    printf("Queries per second: %.3f\n", qps_fanns_survey);
+    printf("Recall: %.3f\n", best_recall);
 
     // Cleanup
     delete[] query_data;
-    if (gt_ids_raw) delete[] gt_ids_raw;
-    if (gt_dists_raw) delete[] gt_dists_raw;
+    // Note: gt_ids is a vector, automatically cleaned up
 
     return 0;
 }
