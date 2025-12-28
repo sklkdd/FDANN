@@ -284,6 +284,9 @@ int search_memory_index_em_r(
     }
 
     for (uint32_t L : Lvec) {
+        // FDANN requires L >= K in search_with_filters (index.cpp line 2051)
+        // Since we pass expanded_k as K, we must ensure L >= expanded_k
+        uint32_t effective_L = std::max(L, static_cast<uint32_t>(expanded_k));
         
         auto start = std::chrono::high_resolution_clock::now();
         
@@ -293,7 +296,7 @@ int search_memory_index_em_r(
                 query_data + i * query_aligned_dim,
                 em_only_filters[i],  // EM-only filter
                 expanded_k,          // Request more candidates
-                L,
+                effective_L,         // Search list size (must be >= expanded_k)
                 query_result_ids.data() + i * expanded_k,
                 query_result_dists.data() + i * expanded_k
             );
