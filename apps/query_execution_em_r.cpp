@@ -217,7 +217,7 @@ int search_memory_index_em_r(
                       .with_metric(metric)
                       .with_dimension(query_dim)
                       .with_max_points(0)
-                      .with_data_load_store_strategy(diskann::MEMORY)
+                      .with_data_load_store_strategy(diskann::DataStoreStrategy::MEMORY)
                       .with_data_type(diskann_type_to_name<T>())
                       .with_label_type(diskann_type_to_name<LabelT>())
                       .with_tag_type(diskann_type_to_name<TagT>())
