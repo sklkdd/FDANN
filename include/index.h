@@ -145,23 +145,6 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                                                                         const size_t K, const uint32_t L,
                                                                         IndexType *indices, float *distances);
 
-    // EM+R filter support: Load scalar attributes for range filtering
-    DISKANN_DLLEXPORT void load_scalar_attributes(const std::string &scalar_file);
-
-    // EM+R filter support: Check if point satisfies range predicate
-    DISKANN_DLLEXPORT bool detect_range_match(uint32_t point_id, int32_t low, int32_t high);
-
-    // EM+R filter support: Combined EM and Range filter detection
-    DISKANN_DLLEXPORT bool detect_combined_filters(uint32_t point_id, bool search_invocation,
-                                                   const std::vector<LabelT> &incoming_labels,
-                                                   int32_t range_low, int32_t range_high);
-
-    // EM+R filter support: Search with combined EM+R filters
-    template <typename IdType>
-    DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> search_with_combined_filters(
-        const T *query, const LabelT &filter_label, int32_t range_low, int32_t range_high,
-        const size_t K, const uint32_t L, IdType *indices, float *distances);
-
     // Will fail if tag already in the index or if tag=0.
     DISKANN_DLLEXPORT int insert_point(const T *point, const TagT tag);
 
@@ -400,10 +383,6 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     std::string _labels_file;
     std::unordered_map<LabelT, uint32_t> _label_to_start_id;
     std::unordered_map<uint32_t, uint32_t> _medoid_counts;
-
-    // EM+R filter support: Range attribute storage
-    std::vector<int32_t> _location_to_scalar;
-    bool _has_scalar_attribute = false;
 
     bool _use_universal_label = false;
     LabelT _universal_label = 0;
