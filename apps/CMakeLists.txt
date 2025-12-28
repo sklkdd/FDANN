@@ -34,6 +34,9 @@ target_link_libraries(index_construction ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLO
 add_executable(query_execution query_execution.cpp)
 target_link_libraries(query_execution ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
 
+add_executable(query_execution_em_r query_execution_em_r.cpp)
+target_link_libraries(query_execution_em_r ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
 add_executable(build_memory_index_wrapper build_memory_index_wrapper.cpp)
 target_link_libraries(build_memory_index_wrapper ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
 
@@ -48,6 +51,7 @@ if (NOT MSVC)
             test_insert_deletes_consolidate
 			index_construction 
 			query_execution
+			query_execution_em_r
             RUNTIME
     )
 endif()
