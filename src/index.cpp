@@ -2121,6 +2121,188 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
     return retval;
 }
 
+// ============================================================================
+// EM+R Filter Support Implementation
+// ============================================================================
+
+// Load scalar attributes from CSV file (one integer per line)
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::load_scalar_attributes(const std::string &scalar_file)
+{
+    std::ifstream file(scalar_file);
+    if (!file.is_open())
+    {
+        throw diskann::ANNException("Failed to open scalar attribute file: " + scalar_file, -1, __FUNCSIG__, __FILE__,
+                                    __LINE__);
+    }
+
+    _location_to_scalar.clear();
+    _location_to_scalar.reserve(_max_points);
+
+    std::string line;
+    size_t line_count = 0;
+    while (std::getline(file, line))
+    {
+        try
+        {
+            int32_t value = std::stoi(line);
+            _location_to_scalar.push_back(value);
+            line_count++;
+        }
+        catch (const std::exception &e)
+        {
+            throw diskann::ANNException("Error parsing line " + std::to_string(line_count) + ": " + e.what(), -1,
+                                        __FUNCSIG__, __FILE__, __LINE__);
+        }
+    }
+
+    if (_location_to_scalar.size() != _max_points)
+    {
+        diskann::cerr << "Warning: Scalar attribute count (" << _location_to_scalar.size()
+                      << ") does not match index size (" << _max_points << ")" << std::endl;
+    }
+
+    _has_scalar_attribute = true;
+    diskann::cout << "Loaded " << _location_to_scalar.size() << " scalar attributes from " << scalar_file
+                  << std::endl;
+}
+
+// Check if a point satisfies the range predicate [low, high]
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::detect_range_match(uint32_t point_id, int32_t low, int32_t high)
+{
+    if (!_has_scalar_attribute || point_id >= _location_to_scalar.size())
+    {
+        return false;
+    }
+    int32_t value = _location_to_scalar[point_id];
+    return (value >= low && value <= high);
+}
+
+// Combined EM and Range filter detection
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::detect_combined_filters(uint32_t point_id, bool search_invocation,
+                                                     const std::vector<LabelT> &incoming_labels, int32_t range_low,
+                                                     int32_t range_high)
+{
+    // Check EM filter first (cheaper operation, uses set intersection)
+    bool em_match = detect_common_filters(point_id, search_invocation, incoming_labels);
+    if (!em_match)
+    {
+        return false; // Early exit if EM fails
+    }
+
+    // Check range filter (numerical comparison)
+    bool r_match = detect_range_match(point_id, range_low, range_high);
+    return r_match; // Both must be true for combined filter
+}
+
+// Search with combined EM+R filters
+template <typename T, typename TagT, typename LabelT>
+template <typename IdType>
+std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_combined_filters(
+    const T *query, const LabelT &filter_label, int32_t range_low, int32_t range_high, const size_t K,
+    const uint32_t L, IdType *indices, float *distances)
+{
+    if (K > (uint64_t)L)
+    {
+        throw ANNException("Set L to a value of at least K", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    if (!_has_scalar_attribute)
+    {
+        throw ANNException("Scalar attributes not loaded. Call load_scalar_attributes() first.", -1, __FUNCSIG__,
+                           __FILE__, __LINE__);
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+
+    if (L > scratch->get_L())
+    {
+        diskann::cout << "Attempting to expand query scratch_space. Was created "
+                      << "with Lsize: " << scratch->get_L() << " but search L is: " << L << std::endl;
+        scratch->resize_for_new_L(L);
+        diskann::cout << "Resize completed. New scratch->L is " << scratch->get_L() << std::endl;
+    }
+
+    std::vector<LabelT> filter_vec;
+    std::vector<uint32_t> init_ids = get_init_ids();
+
+    std::shared_lock<std::shared_timed_mutex> lock(_update_lock);
+    std::shared_lock<std::shared_timed_mutex> tl(_tag_lock, std::defer_lock);
+    if (_dynamic_index)
+        tl.lock();
+
+    // Find label-specific start point (EM optimization)
+    if (_label_to_start_id.find(filter_label) != _label_to_start_id.end())
+    {
+        init_ids.emplace_back(_label_to_start_id[filter_label]);
+    }
+    else
+    {
+        diskann::cout << "No filtered medoid found for label. exitting" << std::endl;
+        throw diskann::ANNException("No filtered medoid found for label", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    if (_dynamic_index)
+        tl.unlock();
+
+    filter_vec.emplace_back(filter_label);
+
+    _data_store->preprocess_query(query, scratch);
+
+    // Note: iterate_to_fixed_point only applies EM filtering during graph traversal
+    // We post-filter results by range predicate since modifying iterate_to_fixed_point
+    // would require extensive refactoring of the template method
+    auto retval = iterate_to_fixed_point(scratch, L, init_ids, true, filter_vec, true);
+
+    auto best_L_nodes = scratch->best_l_nodes();
+
+    // Post-filter: Extract top-K results that satisfy both EM and Range predicates
+    size_t pos = 0;
+    for (size_t i = 0; i < best_L_nodes.size(); ++i)
+    {
+        uint32_t id = best_L_nodes[i].id;
+
+        if (id < _max_points)
+        {
+            // Check range predicate (EM already checked during iterate_to_fixed_point)
+            if (detect_range_match(id, range_low, range_high))
+            {
+                indices[pos] = (IdType)id;
+
+                if (distances != nullptr)
+                {
+#ifdef EXEC_ENV_OLS
+                    // DLVS expects negative distances
+                    distances[pos] = best_L_nodes[i].distance;
+#else
+                    distances[pos] = _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * best_L_nodes[i].distance
+                                                                                      : best_L_nodes[i].distance;
+#endif
+                }
+                pos++;
+            }
+        }
+
+        if (pos == K)
+            break;
+    }
+
+    if (pos < K)
+    {
+        diskann::cerr << "Found fewer than K elements for EM+R query (EM=" << filter_label << ", R=[" << range_low
+                      << "," << range_high << "])" << std::endl;
+    }
+
+    return retval;
+}
+
+// ============================================================================
+// End of EM+R Filter Support
+// ============================================================================
+
 template <typename T, typename TagT, typename LabelT>
 size_t Index<T, TagT, LabelT>::_search_with_tags(const DataType &query, const uint64_t K, const uint32_t L,
                                                  const TagType &tags, float *distances, DataVector &res_vectors,
@@ -3417,6 +3599,46 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t,
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
               float *distances);
+
+// EM+R filter support template instantiations
+// TagT==uint64_t, LabelT==uint32_t
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const float *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const float *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const uint8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const uint8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const int8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const int8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
+// TagT==uint32_t, LabelT==uint32_t
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const float *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const float *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const uint8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const uint8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_combined_filters<
+    uint64_t>(const int8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint64_t *indices, float *distances);
+template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_combined_filters<
+    uint32_t>(const int8_t *query, const uint32_t &filter_label, int32_t range_low, int32_t range_high,
+              const size_t K, const uint32_t L, uint32_t *indices, float *distances);
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search<uint64_t>(
     const float *query, const size_t K, const uint32_t L, uint64_t *indices, float *distances);
