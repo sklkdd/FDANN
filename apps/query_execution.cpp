@@ -38,7 +38,8 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                         const std::string &query_file, const std::string &truthset_file, const uint32_t num_threads,
                         const uint32_t recall_at, const bool print_all_recalls, const std::vector<uint32_t> &Lvec,
                         const bool dynamic, const bool tags, const bool show_qps_per_thread,
-                        const std::vector<std::string> &query_filters, const float fail_if_recall_below)
+                        const std::vector<std::string> &query_filters, const std::string &filter_type,
+                        const float fail_if_recall_below)
 {
     // Restrict number of threads to 1 for query execution
     omp_set_num_threads(1);
@@ -96,6 +97,24 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
                          "filters file"
                       << std::endl;
             return -1; // To return -1 or some other error handling?
+        }
+    }
+
+    // For EM+R queries, load scalar attributes
+    if (filtered_search && filter_type == "EM_R")
+    {
+        // Scalar attributes should be stored alongside the index
+        std::string scalar_attr_file = index_path + ".scalar_attributes";
+        if (file_exists(scalar_attr_file))
+        {
+            std::cout << "Loading scalar attributes from: " << scalar_attr_file << std::endl;
+            index->load_scalar_attributes(scalar_attr_file);
+        }
+        else
+        {
+            std::cerr << "Error: Scalar attribute file not found: " << scalar_attr_file << std::endl;
+            std::cerr << "EM+R queries require scalar attributes to be available." << std::endl;
+            return -1;
         }
     }
 
@@ -202,10 +221,58 @@ int search_memory_index(diskann::Metric &metric, const std::string &index_path, 
             {
                 std::string raw_filter = query_filters.size() == 1 ? query_filters[0] : query_filters[i];
 
-                auto retval = index->search_with_filters(query + i * query_aligned_dim, raw_filter, recall_at, L,
-                                                         query_result_ids[test_id].data() + i * recall_at,
-                                                         query_result_dists[test_id].data() + i * recall_at);
-                cmp_stats[i] = retval.second;
+                if (filter_type == "EM_R")
+                {
+                    // Parse EM+R format: "<em>,<r_start>-<r_end>"
+                    size_t comma_pos = raw_filter.find(',');
+                    if (comma_pos == std::string::npos)
+                    {
+                        std::cerr << "Error: Invalid EM_R filter format at query " << i << ": " << raw_filter
+                                  << std::endl;
+                        continue;
+                    }
+
+                    std::string em_str = raw_filter.substr(0, comma_pos);
+                    std::string range_str = raw_filter.substr(comma_pos + 1);
+
+                    size_t dash_pos = range_str.find('-');
+                    if (dash_pos == std::string::npos)
+                    {
+                        std::cerr << "Error: Invalid range format in filter at query " << i << ": " << raw_filter
+                                  << std::endl;
+                        continue;
+                    }
+
+                    std::string r_start_str = range_str.substr(0, dash_pos);
+                    std::string r_end_str = range_str.substr(dash_pos + 1);
+
+                    try
+                    {
+                        LabelT em_label = static_cast<LabelT>(std::stoul(em_str));
+                        int32_t r_start = std::stoi(r_start_str);
+                        int32_t r_end = std::stoi(r_end_str);
+
+                        auto retval =
+                            index->search_with_combined_filters(query + i * query_aligned_dim, em_label, r_start,
+                                                                r_end, recall_at, L,
+                                                                query_result_ids[test_id].data() + i * recall_at,
+                                                                query_result_dists[test_id].data() + i * recall_at);
+                        cmp_stats[i] = retval.second;
+                    }
+                    catch (const std::exception &e)
+                    {
+                        std::cerr << "Error parsing EM_R filter at query " << i << ": " << e.what() << std::endl;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Regular EM filter
+                    auto retval = index->search_with_filters(query + i * query_aligned_dim, raw_filter, recall_at, L,
+                                                             query_result_ids[test_id].data() + i * recall_at,
+                                                             query_result_dists[test_id].data() + i * recall_at);
+                    cmp_stats[i] = retval.second;
+                }
             }
             else if (metric == diskann::FAST_L2)
             {
@@ -406,22 +473,29 @@ int main(int argc, char **argv)
 
 	// Read the query attributes
     std::vector<std::string> query_filters;
-	if (query_filters_file != "")
+    std::string filter_type = "EM"; // Default filter type
+    if (query_filters_file != "")
     {
         query_filters = read_file_to_vector_of_strings(query_filters_file);
-    }
-
+        
+        // Detect filter type based on format of first filter
+        // EM format: single value (e.g., "0" or "category_name")
+        // EM_R format: "<em>,<r_start>-<r_end>" (e.g., "2,496-714")
+        if (!query_filters.empty())
+        {
+            std::string sample_filter = query_filters[0];
+            if (sample_filter.find(',') != std::string::npos)
+            {
+                filter_type = "EM_R";
+                std::cout << "Detected EM+R filter format" << std::endl;
+            }
+        }
 	// Perform the search: We hard-code for float data
     try
     {
 		return search_memory_index<float>(metric, index_path_prefix, result_path, query_file, gt_file,
 											  num_threads, K, print_all_recalls, Lvec, dynamic, tags,
-											  show_qps_per_thread, query_filters, fail_if_recall_below);
-    }
-    catch (std::exception &e)
-    {
-        std::cout << std::string(e.what()) << std::endl;
-        diskann::cerr << "Index search failed." << std::endl;
+											  show_qps_per_thread, query_filters, filter_type, fail_if_recall_below);
         return -1;
     }
 }
